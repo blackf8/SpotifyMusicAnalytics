@@ -1,0 +1,5 @@
+secrets.yaml
+spotify_env
+dags/__pycache__/
+logs/
+sql_queries/
