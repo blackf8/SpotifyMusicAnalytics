@@ -1,16 +1,15 @@
 import pandas as pd
 from selenium import webdriver
-from selenium.webdriver.common.desired_capabilities import DesiredCapabilities
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
-import chromedriver_autoinstaller
 import time
 import logging
 import pendulum
-import pandas
 from sqlalchemy import create_engine
 from airflow.models import Variable
+from airflow.utils.state import State
+from airflow import AirflowException
 
 
 def delayed_send_keys(element, key, occurrence, delay):
@@ -52,12 +51,6 @@ def get_driver():
     hub_url = "http://my-selenium-grid-driver:4444"
     options = Options()
     options.add_argument("--disable-dev-shm-usage")
-    """
-    Disabled additional options while creating scraper.
-    options.add_argument("--headless=new")
-    options.add_argument("--incognito")
-    options.add_argument('--disable-blink-features=AutomationControlled')
-    """
     driver = webdriver.Remote(command_executor=hub_url, options=options)
     driver.get('https://spotify.com')
     driver.fullscreen_window()
@@ -94,7 +87,6 @@ def log_in(driver, login_button):
     delayed_send_keys(email_field, email, 1, 2)
     delayed_send_keys(password_field, password, 1, 2)
     delayed_send_keys(password_field, Keys.ENTER, 1, 7)
-    driver.fullscreen_window()
 
 
 def fetch_playing_song(driver):
@@ -143,48 +135,59 @@ def upload_df_to_db(conn_string, table_name, df):
     return df.shape
 
 
-def save_current_driver_session(driver):
+def navigate_driver(driver, ti):
     """
-    Description: Testing if we can reuse a driver session to reduce api calls.
-    :param driver:
-    :return:
+    Description: A wrapper method that is used to navigate the webdriver.
+                 Uses the driver to return back spotify data.
+    :param driver: Webdriver Object
+    :param ti: Context['task_instance']
+    :return: Spotify Data on Currently Played Song.
     """
-    url = driver.command_executor._url
-    session_id = driver.session_id
-    print(url, session_id)
-    return url, session_id
+    prev_ti = ti.get_previous_ti(state=State.SUCCESS)
+    cookies = prev_ti.xcom_pull(key="cookies", task_ids="fetch_spotify_song")
+    logging.info("Fetching Web Driver.")
+    if cookies is not None:
+        logging.info("Updating Cookies and Refreshing.")
+        for c in cookies:
+            driver.add_cookie(c)
+        logging.info(f"Added {len(cookies)} Cookies to Driver.")
+        driver.refresh()
+        driver.fullscreen_window()
+    time.sleep(3)
+
+    login_button = is_logged_in(driver)
+    if login_button:
+        log_in(driver, login_button)
+    driver.refresh()
+    driver.fullscreen_window()
+
+    logging.info("Saving Cookies to XCom.")
+    ti.xcom_push(key="cookies", value=driver.get_cookies())
+
+    time.sleep(3)
+    logging.info("Get Current Song")
+    current_song, artist, current_time = fetch_playing_song(driver)
+    logging.info(f"Song: {current_song}")
+    logging.info(f"Artist: {artist}")
+    logging.info(f"Time: {current_time}")
+    return current_song, artist, current_time
 
 
-def scrape_song():
+def scrape_song(**context):
     conn_string = (f'postgresql://{Variable.get("user")}:'
                    f'{Variable.get("password")}'
                    f'@host.docker.internal:{Variable.get("port")}/'
                    f'{Variable.get("database")}')
-    print("Get Driver")
     driver = get_driver()
-
-    print("Testing if I can save and reuse a driver")
-    save_current_driver_session(driver)
-
-    print("Log In")
-    login_button = is_logged_in(driver)
-    print(login_button)
-    if login_button:
-        log_in(driver, login_button)
-    else:
-        driver.refresh()
-
-    print("Get Current Song")
-    current_song, artist, current_time = fetch_playing_song(driver)
-    print(f"Song: {current_song}")
-    print(f"Artist: {artist}")
-    print(f"Time: {current_time}")
-    print(current_time.to_datetime_string())
-
+    try:
+        current_song, artist, current_time = navigate_driver(driver, context['task_instance'])
+    except Exception as e:
+        logging.info(e)
+        driver.quit()
+        raise AirflowException("Driver Error")
+    driver.quit()
     spotify_df = pd.DataFrame.from_dict({'time_played': [str(current_time.to_datetime_string())],
                                          'song': [current_song],
                                          'artist': [artist]})
     df_shape = upload_df_to_db(conn_string, 'played_songs', spotify_df)
-    print(f"Uploaded data: {df_shape}")
-    print("Quitting Driver")
-    driver.quit()
+    logging.info(f"Uploaded data: {df_shape}")

@@ -17,13 +17,15 @@ spotify_table_name = 'spotify_table'
 with DAG(dag_id='spotify_dag',
          max_active_runs=1,
          default_args=default_args,
-         schedule_interval=timedelta(seconds=90),
+         schedule_interval=timedelta(seconds=60),
          catchup=False,
          ) as dag:
     fetch_song = PythonOperator(
         task_id='fetch_spotify_song',
         python_callable=scrape_song,
+        provide_context=True,
         op_kwargs={'table_name': spotify_table_name},
+        execution_timeout=timedelta(seconds=60),
         retries=1,
         retry_delay=timedelta(seconds=15))
     fetch_song
